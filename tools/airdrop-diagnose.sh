@@ -59,6 +59,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+# Whether the phone acknowledges what we send it: mac80211's own counters for
+# each station in the ad-hoc cell (or the converted station), every few seconds.
+radio_snapshot() {
+  local dev
+  {
+    printf '### %s\n' "$(date +%T)"
+    for dev in awdlibss0 "$(cat "$RUN/station" 2>/dev/null)"; do
+      [ -n "$dev" ] && iw dev "$dev" info 2>/dev/null | grep -E 'Interface|type|channel|txpower'
+      [ -n "$dev" ] && iw dev "$dev" station dump 2>/dev/null \
+        | grep -E 'Station|signal:|tx packets|tx retries|tx failed|rx packets|tx bitrate|rx bitrate|inactive'
+    done
+  } >> "$OUT/radio.log" 2>&1
+}
+
 count() { tcpdump -nn -r "$OUT/awdl0.pcap" "$@" 2>/dev/null | wc -l; }
 
 summarise() {
@@ -81,6 +95,7 @@ summarise() {
     echo "receiver: connections logged:         $(grep -c 'connection from' "$OUT/receiver.log" 2>/dev/null)"
     echo "receiver: files stored:               $(grep -c ': stored \|link stored as' "$OUT/receiver.log" 2>/dev/null)"
     echo "send to the phone:                    $(cat "$OUT/send-result" 2>/dev/null || echo 'not tried')"
+    echo "frames to the phone, sent/retried/failed: $(awk '/tx packets/ {p=$3} /tx retries/ {r=$3} /tx failed/ {f=$3} END {print (p==""?"none":p"/"r"/"f)}' "$OUT/radio.log" 2>/dev/null)"
     echo "times OWL lost the phone:             $(grep -c 'remove peer' "$OUT/owl.log" 2>/dev/null)"
     echo "TCP SYNs we sent to port 8770:        $(count "ip6 and tcp dst port 8770 and ip6[53] & 0x12 == 0x02")"
     [ -s "$OUT/helper-calls.txt" ] && echo "Scan polls (helper 'peers' calls):    $(grep -c ' omdrop-discoverable peers' "$OUT/helper-calls.txt")"
@@ -143,6 +158,7 @@ if (( WATCH )); then
       "$(( $(grep -c 'add peer' "$RUN/owl.log" 2>/dev/null) - $(grep -c 'remove peer' "$RUN/owl.log" 2>/dev/null) ))" \
       "$(grep -c 'connection from' "$OUT/receiver.log")" \
       "$(grep -c ': stored \|link stored as' "$OUT/receiver.log")"
+    (( t % 5 )) || radio_snapshot
     sleep 1; t=$(( t + 1 ))
   done
   journalctl --since "$SINCE" --no-pager -o short-iso 2>/dev/null \
@@ -164,6 +180,7 @@ for (( t = 0; t < WAIT; t += 5 )); do
     "$(grep -c 'add peer' "$RUN/owl.log" 2>/dev/null)" \
     "$(grep -c 'connection from' "$OUT/receiver.log")" \
     "$(grep -c ': stored \|link stored as' "$OUT/receiver.log")"
+  radio_snapshot
   if grep -q ': stored \|link stored as' "$OUT/receiver.log"; then received=yes; break; fi
   sleep 5
 done
