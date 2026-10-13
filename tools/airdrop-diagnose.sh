@@ -3,6 +3,11 @@
 # report directory to read afterwards.
 #
 #   tools/airdrop-diagnose.sh [SECONDS-TO-WAIT-FOR-THE-PHONE]     (default 180)
+#   tools/airdrop-diagnose.sh --watch
+#
+# --watch turns nothing on or off. It waits for you to switch on in the app,
+# records until you switch off again, and then summarises: for a transfer that
+# works from here and not from the app.
 #
 # Run it as yourself, in a terminal, with the iPhone beside the laptop. It asks
 # for your sudo password once, to capture packets on awdl0 and to read the
@@ -12,6 +17,8 @@
 # when it ends, also on Ctrl-C.
 set -uo pipefail
 
+WATCH=0
+[ "${1:-}" = --watch ] && { WATCH=1; shift; }
 WAIT=${1:-180}
 [ "$(id -u)" != 0 ] || { echo "Run this as yourself, not with sudo."; exit 2; }
 command -v omdrop >/dev/null || { echo "The omdrop command is not installed."; exit 2; }
@@ -23,7 +30,9 @@ RUN=/run/omdrop-owl
 PORT=8771
 step() { printf '\n== %s\n' "$*"; }
 
-echo "This turns Wi-Fi off for a few minutes. Report: $OUT"
+if (( WATCH )); then echo "Recording the next time Omdrop is on. Report: $OUT"
+else echo "This turns Wi-Fi off for a few minutes. Report: $OUT"
+fi
 sudo -v || { echo "sudo is needed for the packet capture."; exit 2; }
 # Keep the sudo timestamp alive: the capture is stopped with it at the end.
 ( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) &
@@ -32,7 +41,7 @@ KEEP=$!
 CAP=
 cleanup() {
   trap - EXIT INT TERM
-  step "Turning Omdrop off and giving Wi-Fi back"
+  (( WATCH )) && step "Collecting" || step "Turning Omdrop off and giving Wi-Fi back"
   [ -n "$CAP" ] && sudo -n kill "$CAP" 2>/dev/null
   [ -n "${JR:-}" ] && kill "$JR" 2>/dev/null
   sleep 1
@@ -40,12 +49,12 @@ cleanup() {
   { grep -v TRACE "$RUN/owl.log" 2>/dev/null; } > "$OUT/owl.log"
   cp "$RUN/log" "$OUT/helper.log" 2>/dev/null
   tail -n 20 "$RUN/announce.log" > "$OUT/announce.log" 2>/dev/null
-  omdrop off --force
+  (( WATCH )) || omdrop off --force
   kill "$KEEP" 2>/dev/null
   sudo -n chown "$(id -u):$(id -g)" "$OUT"/*.pcap 2>/dev/null
   summarise
   echo
-  echo "Done. Wi-Fi reconnects in a few seconds. The report is in $OUT"
+  echo "Done. The report is in $OUT"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -72,6 +81,9 @@ summarise() {
     echo "receiver: connections logged:         $(grep -c 'connection from' "$OUT/receiver.log" 2>/dev/null)"
     echo "receiver: files stored:               $(grep -c ': stored \|link stored as' "$OUT/receiver.log" 2>/dev/null)"
     echo "send to the phone:                    $(cat "$OUT/send-result" 2>/dev/null || echo 'not tried')"
+    echo "times OWL lost the phone:             $(grep -c 'remove peer' "$OUT/owl.log" 2>/dev/null)"
+    echo "TCP SYNs we sent to port 8770:        $(count "ip6 and tcp dst port 8770 and ip6[53] & 0x12 == 0x02")"
+    [ -s "$OUT/helper-calls.txt" ] && echo "Scan polls (helper 'peers' calls):    $(grep -c ' omdrop-discoverable peers' "$OUT/helper-calls.txt")"
   } | tee "$OUT/summary.txt"
   # What the phone asked for over mDNS, by name.
   tcpdump -nn -v -r "$pcap" "udp port 5353 and not src host $me" 2>/dev/null \
@@ -95,13 +107,21 @@ step "System"
 } > "$OUT/system.txt" 2>&1
 echo "saved"
 
-step "Turning Omdrop on (Wi-Fi goes off now)"
 journalctl --user -u airdrop-receiver.service -f -n 0 -o cat > "$OUT/receiver.log" 2>/dev/null &
 JR=$!
-if ! omdrop on 15m; then
-  echo "omdrop on failed; see above."
-  exit 1
+if (( WATCH )); then
+  step "Waiting for you to switch on in the app (Ctrl-C to give up)"
+  until ip link show awdl0 >/dev/null 2>&1; do sleep 0.2; done
+  # The helper's calls show when Scan was running.
+  SINCE=$(date '+%Y-%m-%d %H:%M:%S')
+else
+  step "Turning Omdrop on (Wi-Fi goes off now)"
+  if ! omdrop on 15m; then
+    echo "omdrop on failed; see above."
+    exit 1
+  fi
 fi
+for _ in $(seq 50); do ip -6 -o addr show dev awdl0 scope link 2>/dev/null | grep -q inet6 && break; sleep 0.1; done
 ip -6 -o addr show dev awdl0 scope link | awk '{sub(/\/.*/, "", $4); print $4; exit}' > "$OUT/our-address"
 sudo -n tcpdump -i awdl0 -U -Z root -w "$OUT/awdl0.pcap" >/dev/null 2>&1 &
 sleep 0.5
@@ -114,6 +134,22 @@ CAP=$(pgrep -n -x tcpdump)
   echo "--- nft ruleset"; sudo -n nft list ruleset
 } > "$OUT/network.txt" 2>&1
 omdrop status
+
+if (( WATCH )); then
+  step "Recording. Use the app and the phone now; switch off in the app when you are done."
+  t=0
+  while ip link show awdl0 >/dev/null 2>&1; do
+    (( t % 10 )) || printf '  %3d s   peers now: %s   connections: %s   stored: %s\n' "$t" \
+      "$(( $(grep -c 'add peer' "$RUN/owl.log" 2>/dev/null) - $(grep -c 'remove peer' "$RUN/owl.log" 2>/dev/null) ))" \
+      "$(grep -c 'connection from' "$OUT/receiver.log")" \
+      "$(grep -c ': stored \|link stored as' "$OUT/receiver.log")"
+    sleep 1; t=$(( t + 1 ))
+  done
+  journalctl --since "$SINCE" --no-pager -o short-iso 2>/dev/null \
+    | sed -n 's/^\([^ ]*\) .*COMMAND=\/usr\/lib\/omdrop\/\(.*\)\]$/\1 \2/p' > "$OUT/helper-calls.txt"
+  ip -6 neigh show dev awdl0 > "$OUT/neighbours.txt" 2>&1
+  exit 0
+fi
 
 step "Phone -> computer (up to $WAIT s)"
 cat <<EOF
