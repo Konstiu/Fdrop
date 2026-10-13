@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.konstiu.Fdrop</id>
+  <name>Fdrop</name>
+  <summary>AirDrop with nearby Apple devices</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Become visible to nearby Apple devices for a bounded window, receive what
+    they send, and send them files and links from a radar of who is nearby.</p>
+    <p>This is a GNOME front end to the omdrop command. It needs a radio backend
+    such as omdrop-owl.</p>
+  </description>
+  <launchable type="desktop-id">io.github.konstiu.Fdrop.desktop</launchable>
+  <url type="homepage">https://github.com/brentkearney/omdrop-plugin</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-10-13"/>
+  </releases>
+</component>

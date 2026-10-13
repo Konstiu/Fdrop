@@ -1,0 +1,447 @@
+diff --git a/bin/omdrop b/bin/omdrop
+index 4f5ba6c..9e89c5e 100755
+--- a/bin/omdrop
++++ b/bin/omdrop
+@@ -36,6 +36,15 @@
+ # packaging/systemd/airdrop-receiver.service.
+ set -uo pipefail
+ 
++# vercmp comes with pacman. Where there is none (Fedora, Debian), order the two
++# versions with sort -V and answer the same way: -1, 0 or 1.
++command -v vercmp >/dev/null 2>&1 || vercmp() {
++  if [[ "$1" == "$2" ]]; then echo 0
++  elif [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" == "$1" ]]; then echo -1
++  else echo 1
++  fi
++}
++
+ UNIT=airdrop-receiver.service
+ WINDOW=omdrop-window           # transient .timer that closes the window
+ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config.toml"
+@@ -211,7 +220,8 @@ omdrop -- send and receive files with nearby Apple devices
+                     opens received links on double-click. Safe to run again.
+   doctor [--json]   what is still missing before this can receive
+   install-driver    build and install the Wi-Fi driver, in a terminal you watch
+-  firewall ACTION   install or remove Omdrop's narrow UFW receiver rule
++  firewall ACTION   install or remove Omdrop's narrow UFW or firewalld
++                    receiver rule
+   links ACTION      install or remove the double-click handler for received
+                     .url and .webloc links
+   open-link FILE    open a .url or .webloc link in the browser (web links only)
+@@ -446,7 +456,28 @@ plugin_dir() {
+ RECEIVER_PKGS="python-libarchive-c keyutils"
+ receiver_libs_installed() {
+   python3 -c 'from libarchive import stream_reader' >/dev/null 2>&1 \
+-    && [[ -e /usr/lib/libkeyutils.so.1 ]]
++    && python3 -c 'import ctypes; ctypes.CDLL("libkeyutils.so.1")' >/dev/null 2>&1
++}
++
++# The command that installs them, under this distribution's package names.
++# pacman first, so nothing changes where it exists.
++receiver_pkgs_install() {
++  if ! command -v pacman >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
++    echo "sudo dnf install python3-libarchive-c keyutils-libs"
++  else
++    echo "sudo pacman -S --needed --asdeps $RECEIVER_PKGS"
++  fi
++}
++
++# A toast outside Omarchy: the desktop's own notify-send.
++notify() {  # TITLE BODY
++  if command -v omarchy-notification-send >/dev/null 2>&1; then
++    omarchy-notification-send -t 8000 "$1" "$2" >/dev/null 2>&1
++  elif command -v notify-send >/dev/null 2>&1; then
++    notify-send -a Omdrop -t 8000 "$1" "$2" >/dev/null 2>&1
++  else
++    return 1
++  fi
+ }
+ 
+ # The identity this computer presents to Apple devices: its certificate and
+@@ -520,8 +551,7 @@ identity_unlock() { exec 8>&-; }
+ identity_notice() {
+   local msg=$1
+   printf '%s\n' "$msg" >&2
+-  command -v omarchy-notification-send >/dev/null 2>&1 \
+-    && omarchy-notification-send -t 8000 "Omdrop" "$msg" >/dev/null 2>&1
++  notify "Omdrop" "$msg"
+   return 0
+ }
+ 
+@@ -644,7 +674,11 @@ setup_install() {
+   local bindir="${XDG_BIN_HOME:-$HOME/.local/bin}" link current=''
+   link="$bindir/omdrop"
+   [[ -e "$link" || -L "$link" ]] && current=$(readlink -f "$link" 2>/dev/null)
+-  if [[ -z "$current" || "$current" == */plugins/*/bin/omdrop ]]; then
++  # A copy under /usr came from a distribution package, which puts the command
++  # on PATH itself; a link in the home directory would outlive that package.
++  if [[ "$plugin" == /usr/* ]]; then
++    :
++  elif [[ -z "$current" || "$current" == */plugins/*/bin/omdrop ]]; then
+     if mkdir -p "$bindir" && ln -sfn "$plugin/bin/omdrop" "$link"; then
+       [[ "$current" == "$plugin/bin/omdrop" ]] || { did=1; echo "Put the omdrop command on your PATH at $link."; }
+     else
+@@ -916,8 +950,68 @@ ufw_active() {
+     && systemctl is-active --quiet ufw.service
+ }
+ 
++# firewalld (Fedora) has no rule that names an interface, so the same exception
++# goes into the zone awdl0 falls in, as a rich rule: IPv6 link-local to
++# link-local, TCP 8771. Nothing is added when that zone already lets the port
++# in, as Fedora Workstation's does (1025-65535).
++FIREWALLD_RULE='rule family="ipv6" source address="fe80::/10" destination address="fe80::/10" port port="8771" protocol="tcp" accept'
++
++firewalld_active() {
++  command -v firewall-cmd >/dev/null 2>&1 \
++    && systemctl is-active --quiet firewalld.service
++}
++
++firewalld_zone() {
++  firewall-cmd --get-zone-of-interface=awdl0 2>/dev/null || firewall-cmd --get-default-zone
++}
++
++firewalld_open() {  # ZONE
++  local p lo hi
++  firewall-cmd --zone="$1" --query-rich-rule="$FIREWALLD_RULE" >/dev/null 2>&1 && return 0
++  for p in $(firewall-cmd --zone="$1" --list-ports 2>/dev/null); do
++    [[ "$p" == */tcp ]] || continue
++    p=${p%/tcp}; lo=${p%-*}; hi=${p#*-}
++    [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || continue
++    (( lo <= 8771 && 8771 <= hi )) && return 0
++  done
++  return 1
++}
++
++# Whether `firewall install` has anything to do here.
++firewall_rule_wanted() {
++  ufw_active && return 0
++  firewalld_active && ! firewalld_open "$(firewalld_zone)"
++}
++
++cmd_firewall_firewalld() {
++  local action=$1 zone; zone=$(firewalld_zone) || die "omdrop could not ask firewalld for its zones."
++  case "$action" in
++    install)
++      if firewalld_open "$zone"; then
++        echo "firewalld's $zone zone already lets the AirDrop receiver's port in; Omdrop did not change its configuration."
++        return 0
++      fi
++      echo "Allowing AirDrop receiver traffic in firewalld's $zone zone: only from IPv6 link-local peers, to TCP 8771."
++      sudo firewall-cmd --permanent --zone="$zone" --add-rich-rule="$FIREWALLD_RULE" \
++        && sudo firewall-cmd --zone="$zone" --add-rich-rule="$FIREWALLD_RULE"
++      ;;
++    remove)
++      if ! firewall-cmd --zone="$zone" --query-rich-rule="$FIREWALLD_RULE" >/dev/null 2>&1; then
++        echo "There is no Omdrop rule in firewalld's $zone zone to remove."
++        return 0
++      fi
++      sudo firewall-cmd --permanent --zone="$zone" --remove-rich-rule="$FIREWALLD_RULE"
++      sudo firewall-cmd --zone="$zone" --remove-rich-rule="$FIREWALLD_RULE"
++      ;;
++  esac
++}
++
+ cmd_firewall() {
+   local action=${1:-}
++  if [[ "$action" == install || "$action" == remove ]] && ! ufw_active && firewalld_active; then
++    cmd_firewall_firewalld "$action"
++    return
++  fi
+   case "$action" in
+     install)
+       if ! command -v ufw >/dev/null 2>&1; then
+@@ -1073,8 +1167,8 @@ install_for_backend() {
+   # something this command can do.
+   backend_contract_ok || echo "$(backend_contract_say)" >&2
+   receiver_libs_installed || build="$build
+-sudo pacman -S --needed --asdeps $RECEIVER_PKGS"
+-  ufw_active && build="$build
++$(receiver_pkgs_install)"
++  firewall_rule_wanted && build="$build
+ $self_q firewall install"
+   if [[ "$build" == "set -e" ]]; then
+     echo "The receiver's packages are installed and the radio comes from $(probe_field backend) $(probe_field version). Nothing to do."
+@@ -2295,7 +2389,11 @@ act_open() {
+ cmd_open_link() {
+   local f=${1:?usage: omdrop open-link FILE} url raw why
+   if url=$(link_target "$f"); then
+-    omarchy-launch-browser "$url" >/dev/null 2>&1
++    if command -v omarchy-launch-browser >/dev/null 2>&1; then
++      omarchy-launch-browser "$url" >/dev/null 2>&1
++    else
++      launch xdg-open "$url"
++    fi
+     return
+   fi
+   if raw=$(link_url "$f") && [[ "$raw" == *:* ]]; then
+@@ -2303,7 +2401,7 @@ cmd_open_link() {
+   else
+     why="There is no web link in it."
+   fi
+-  omarchy-notification-send "Can't open $(basename "$f")" "$why" >/dev/null 2>&1 \
++  notify "Can't open $(basename "$f")" "$why" \
+     || echo "omdrop: can't open $f: $why" >&2
+   return 1
+ }
+@@ -2558,9 +2656,23 @@ act_notify() {
+   # claiming the urgency of one.
+   local what="Saved to $(tildify "$(dirname "$f")")/"
+   command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname "$f")")/"
+-  omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
+-    "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
+-    || echo "omdrop: notification failed for $f" >&2
++  if command -v omarchy-notification-send >/dev/null 2>&1; then
++    omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
++      "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
++      || echo "omdrop: notification failed for $f" >&2
++  elif command -v notify-send >/dev/null 2>&1; then
++    # Outside Omarchy: notify-send waits for the toast and prints the action
++    # that was clicked, which is the same single default action.
++    local icon=()
++    (( ${#args[@]} )) && icon=(-i "$f")
++    local clicked
++    clicked=$(notify-send -a Omdrop -t 8000 "${icon[@]}" -A default=Open \
++                "$(basename "$f")" "$what (or click this)" 2>/dev/null) \
++      || echo "omdrop: notification failed for $f" >&2
++    [[ "$clicked" == default ]] && act_open "$f"
++  else
++    echo "omdrop: no notification service for $f" >&2
++  fi
+ }
+ 
+ # What to do with a file once the user has asked for it: `act open` is what the
+@@ -2756,7 +2868,12 @@ cmd_senders() {
+       [[ -f "$f" ]] || die "no known-senders list yet"
+       local id tmp; tmp=$(mktemp)
+       cp "$f" "$tmp"
+-      for id in "$@"; do grep -vxF "$id" "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"; done
++      # grep exits 1 when nothing is left, which is what removing the last
++      # sender looks like; only a real error (2) may keep the old list.
++      for id in "$@"; do
++        grep -vxF "$id" "$tmp" > "$tmp.n" || (( $? == 1 )) || die "omdrop could not rewrite the known-senders list."
++        mv "$tmp.n" "$tmp"
++      done
+       mv "$tmp" "$f"
+       printf 'Removed. %s known now.\n' "$(sender_count)" ;;
+     *) die "usage: omdrop senders [list|add <id>|remove <id>]" ;;
+diff --git a/tests/test_fedora.py b/tests/test_fedora.py
+new file mode 100644
+index 0000000..b3000fd
+--- /dev/null
++++ b/tests/test_fedora.py
+@@ -0,0 +1,173 @@
++"""Running outside Arch: firewalld instead of UFW, dnf instead of pacman, no
++vercmp, and notify-send instead of Omarchy's notifier. Every command the CLI
++would reach for is a stub in a private bin directory, so the answers do not
++depend on the machine the tests run on."""
++import os
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[1]
++OMDROP = ROOT / "bin" / "omdrop"
++
++RULE = ('rule family="ipv6" source address="fe80::/10" destination address="fe80::/10" '
++        'port port="8771" protocol="tcp" accept')
++
++
++class Stubbed(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.bin = Path(self.tmp.name) / "bin"
++        self.bin.mkdir()
++        self.capture = Path(self.tmp.name) / "capture"
++        self.env = os.environ.copy()
++        self.env.update(
++            PATH=f"{self.bin}:{self.env['PATH']}",
++            CAPTURE=str(self.capture),
++            HOME=self.tmp.name,
++            XDG_CONFIG_HOME=str(Path(self.tmp.name) / "config"),
++        )
++
++    def command(self, name, body):
++        path = self.bin / name
++        path.write_text(body)
++        path.chmod(0o755)
++
++    def run_omdrop(self, *args):
++        return subprocess.run([OMDROP, *args], env=self.env, capture_output=True, text=True)
++
++
++class FirewalldTests(Stubbed):
++    def setUp(self):
++        super().setUp()
++        # Only firewalld is active, whatever else the machine has installed.
++        self.command("systemctl", """#!/bin/sh
++[ "$1" = is-active ] || exit 0
++case "$*" in *firewalld.service*) exit 0 ;; esac
++exit 3
++""")
++        self.command("sudo", """#!/bin/sh
++for arg do printf '<%s>' "$arg" >> "$CAPTURE"; done
++echo >> "$CAPTURE"
++""")
++        self.command("firewall-cmd", """#!/bin/sh
++case "$*" in
++  *--get-zone-of-interface*) exit 2 ;;
++  *--get-default-zone*) echo public ;;
++  *--query-rich-rule*) exit "${RICH_RC:-1}" ;;
++  *--list-ports*) echo "${PORTS:-}" ;;
++esac
++""")
++
++    def test_install_adds_one_link_local_rule_to_the_zone_awdl0_falls_in(self):
++        result = self.run_omdrop("firewall", "install")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(self.capture.read_text().splitlines(), [
++            f"<firewall-cmd><--permanent><--zone=public><--add-rich-rule={RULE}>",
++            f"<firewall-cmd><--zone=public><--add-rich-rule={RULE}>",
++        ])
++
++    def test_install_changes_nothing_when_the_zone_already_lets_the_port_in(self):
++        # Fedora Workstation's default zone.
++        self.env["PORTS"] = "1025-65535/udp 1025-65535/tcp"
++
++        result = self.run_omdrop("firewall", "install")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertFalse(self.capture.exists())
++        self.assertIn("already", result.stdout)
++
++    def test_a_udp_range_or_another_port_does_not_count_as_open(self):
++        self.env["PORTS"] = "1025-65535/udp 8770/tcp 9000-9100/tcp"
++
++        result = self.run_omdrop("firewall", "install")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(len(self.capture.read_text().splitlines()), 2)
++
++    def test_remove_takes_out_only_the_rule_it_added(self):
++        self.env["RICH_RC"] = "0"
++
++        result = self.run_omdrop("firewall", "remove")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(self.capture.read_text().splitlines(), [
++            f"<firewall-cmd><--permanent><--zone=public><--remove-rich-rule={RULE}>",
++            f"<firewall-cmd><--zone=public><--remove-rich-rule={RULE}>",
++        ])
++
++    def test_remove_without_a_rule_asks_for_no_privilege(self):
++        result = self.run_omdrop("firewall", "remove")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertFalse(self.capture.exists())
++
++
++class WithoutPacmanTests(Stubbed):
++    """A probing backend with a contract, on a machine that has dnf and no
++    pacman or vercmp."""
++
++    def setUp(self):
++        super().setUp()
++        # A PATH of stubs and the base system only: no pacman, no vercmp, even
++        # on a machine that has them.
++        for tool in ("bash", "sh", "cat", "sort", "head", "grep", "sed", "readlink", "dirname",
++                     "basename", "id", "mkdir", "env", "tr", "awk", "hostname", "timeout",
++                     "sleep", "rm", "mktemp", "flock", "date", "tail", "printf", "ln"):
++            for d in ("/usr/bin", "/bin"):
++                if Path(d, tool).exists():
++                    (self.bin / tool).symlink_to(Path(d, tool))
++                    break
++        self.env["PATH"] = str(self.bin)
++        self.command("dnf", "#!/bin/sh\nexit 0\n")
++        self.command("systemctl", "#!/bin/sh\nexit 3\n")
++        # The receiver's libraries are missing; everything else python3 does
++        # for the CLI (JSON in and out) goes to the real one.
++        real = subprocess.run(["sh", "-c", "command -v python3"], capture_output=True,
++                              text=True).stdout.strip()
++        self.command("python3", f"""#!/bin/sh
++case "$2" in *libarchive*|*libkeyutils*) exit 1 ;; esac
++exec {real} "$@"
++""")
++        self.backend = Path(self.tmp.name) / "omdrop-discoverable"
++        self.env["OMDROP_DISCOVERABLE"] = str(self.backend)
++
++    def probe(self, contract):
++        self.backend.write_text(f"""#!/bin/sh
++[ "$1" = probe ] && echo '{{"backend": "owl", "version": "0.1.0", "contract": "{contract}", "hardware": true, "missing": []}}'
++exit 0
++""")
++        self.backend.chmod(0o755)
++
++    def test_a_newer_contract_is_accepted_without_vercmp(self):
++        self.probe("0.10.0")       # sorts below 0.7.0 as text, above it as a version
++
++        result = self.run_omdrop("doctor", "--json")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertNotIn("vercmp", result.stderr)
++        self.assertNotIn('"id": "backend"', result.stdout)
++
++    def test_an_older_contract_is_still_refused(self):
++        self.probe("0.6.9")
++
++        result = self.run_omdrop("doctor", "--json")
++
++        self.assertIn('"id": "backend"', result.stdout)
++
++    def test_the_receiver_packages_are_named_for_dnf(self):
++        self.probe("0.8.1")
++
++        result = self.run_omdrop("install-driver")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn("sudo dnf install python3-libarchive-c keyutils-libs", result.stdout)
++        self.assertNotIn("pacman", result.stdout)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_senders.py b/tests/test_senders.py
+new file mode 100644
+index 0000000..42a52ad
+--- /dev/null
++++ b/tests/test_senders.py
+@@ -0,0 +1,36 @@
++"""The known-senders list, as the panel edits it."""
++import os
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++OMDROP = Path(__file__).resolve().parents[1] / "bin" / "omdrop"
++
++
++class SendersTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.env = {**os.environ, "HOME": self.tmp.name, "XDG_CONFIG_HOME": self.tmp.name}
++
++    def omdrop(self, *args):
++        return subprocess.run([OMDROP, "senders", *args], env=self.env, capture_output=True, text=True)
++
++    def test_the_last_sender_can_be_removed(self):
++        self.omdrop("add", "a@example.com")
++        result = self.omdrop("remove", "a@example.com")
++
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn("0 known", result.stdout)
++        self.assertEqual(self.omdrop("list", "--json").stdout.strip(), "[]")
++
++    def test_removing_one_of_two_keeps_the_other(self):
++        self.omdrop("add", "a@example.com", "+4366012345")
++        self.omdrop("remove", "a@example.com")
++
++        self.assertEqual(self.omdrop("list", "--json").stdout.strip(), '["+4366012345"]')
++
++
++if __name__ == "__main__":
++    unittest.main()

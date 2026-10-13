@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fdrop
+GenericName=AirDrop
+Comment=Send and receive files with nearby Apple devices
+Exec=fdrop
+Icon=io.github.konstiu.Fdrop
+Terminal=false
+Categories=GNOME;GTK;Network;FileTransfer;
+Keywords=Omdrop;AirDrop;Apple;iPhone;Mac;share;send;receive;AWDL;
+StartupNotify=true
+DBusActivatable=false

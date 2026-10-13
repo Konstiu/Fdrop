@@ -1,0 +1,15 @@
+#!/usr/bin/python3
+"""Launch Fdrop. From a source checkout this runs the code beside it; installed,
+the code is in ../share/fdrop."""
+import os
+import sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+for code in (os.path.join(here, "src"), os.path.join(here, "..", "share", "fdrop")):
+    if os.path.isdir(os.path.join(code, "fdrop")):
+        sys.path.insert(0, os.path.abspath(code))
+        break
+
+from fdrop.app import main  # noqa: E402
+
+sys.exit(main())
