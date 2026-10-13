@@ -5,6 +5,13 @@
 #   tools/airdrop-diagnose.sh [SECONDS-TO-WAIT-FOR-THE-PHONE]     (default 180)
 #   tools/airdrop-diagnose.sh --watch
 #
+#   tools/airdrop-diagnose.sh --fresh-mac [SECONDS]
+#
+# --fresh-mac is an experiment: it gives the Wi-Fi card a random address for
+# this one window, so the phone meets a device it has never seen, and puts the
+# real address back afterwards. For a phone that stops seeing this computer
+# after the first window and sees it again once the phone is restarted.
+#
 # --watch turns nothing on or off. It waits for you to switch on in the app,
 # records until you switch off again, and then summarises: for a transfer that
 # works from here and not from the app.
@@ -17,8 +24,9 @@
 # when it ends, also on Ctrl-C.
 set -uo pipefail
 
-WATCH=0
+WATCH=0 FRESH=0 STA= ORIG_MAC=
 [ "${1:-}" = --watch ] && { WATCH=1; shift; }
+[ "${1:-}" = --fresh-mac ] && { FRESH=1; shift; }
 WAIT=${1:-180}
 [ "$(id -u)" != 0 ] || { echo "Run this as yourself, not with sudo."; exit 2; }
 command -v omdrop >/dev/null || { echo "The omdrop command is not installed."; exit 2; }
@@ -50,6 +58,15 @@ cleanup() {
   cp "$RUN/log" "$OUT/helper.log" 2>/dev/null
   tail -n 20 "$RUN/announce.log" > "$OUT/announce.log" 2>/dev/null
   (( WATCH )) || omdrop off --force
+  if [ -n "$ORIG_MAC" ]; then
+    # Back to the card's own address before NetworkManager reconnects with it.
+    sudo -n nmcli device set "$STA" managed no >/dev/null 2>&1
+    sudo -n ip link set "$STA" down
+    sudo -n ip link set "$STA" address "$ORIG_MAC" || echo "could not restore $STA to $ORIG_MAC; a restart does"
+    sudo -n ip link set "$STA" up
+    sudo -n nmcli device set "$STA" managed yes >/dev/null 2>&1
+    echo "$STA is back on its own address: $(cat "/sys/class/net/$STA/address")"
+  fi
   kill "$KEEP" 2>/dev/null
   sudo -n chown "$(id -u):$(id -g)" "$OUT"/*.pcap 2>/dev/null
   summarise
@@ -130,6 +147,26 @@ if (( WATCH )); then
   # The helper's calls show when Scan was running.
   SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 else
+  if (( FRESH )); then
+    step "Giving the Wi-Fi card a random address for this window"
+    STA=$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2 == "wifi" {print $1; exit}')
+    [ -n "$STA" ] || { echo "no Wi-Fi interface found"; exit 1; }
+    # Locally administered, unicast: never a real card's address.
+    NEW_MAC=$(printf '02:%02x:%02x:%02x:%02x:%02x' $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
+    # NetworkManager puts the card's own address back as it lets go, so wait
+    # for that before reading it and before setting ours.
+    sudo -n nmcli device set "$STA" managed no >/dev/null 2>&1
+    sleep 2
+    sudo -n ip link set "$STA" down
+    ORIG_MAC=$(cat "/sys/class/net/$STA/address")
+    if ! sudo -n ip link set "$STA" address "$NEW_MAC"; then
+      echo "the card refused a new address; nothing was changed"
+      sudo -n ip link set "$STA" up; sudo -n nmcli device set "$STA" managed yes >/dev/null 2>&1
+      ORIG_MAC=
+      exit 1
+    fi
+    echo "$STA: $ORIG_MAC -> $NEW_MAC (restored at the end)" | tee "$OUT/fresh-mac.txt"
+  fi
   step "Turning Omdrop on (Wi-Fi goes off now)"
   if ! omdrop on 15m; then
     echo "omdrop on failed; see above."
@@ -137,6 +174,7 @@ else
   fi
 fi
 for _ in $(seq 50); do ip -6 -o addr show dev awdl0 scope link 2>/dev/null | grep -q inet6 && break; sleep 0.1; done
+(( FRESH )) && echo "awdl0 runs as $(cat /sys/class/net/awdl0/address 2>/dev/null) (asked for $NEW_MAC)" | tee -a "$OUT/fresh-mac.txt"
 ip -6 -o addr show dev awdl0 scope link | awk '{sub(/\/.*/, "", $4); print $4; exit}' > "$OUT/our-address"
 sudo -n tcpdump -i awdl0 -U -Z root -w "$OUT/awdl0.pcap" >/dev/null 2>&1 &
 sleep 0.5
