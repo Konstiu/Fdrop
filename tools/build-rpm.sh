@@ -10,12 +10,14 @@
 #   sudo dnf install ./dist/*.rpm
 #
 # OMDROP_SKIP_CHECK=1 skips omdrop's own test suite (about two minutes).
+# RPM_OUT=DIR puts the packages there instead of dist/ (install.sh uses a
+# fresh directory, so it installs exactly what this run built).
 set -euo pipefail
 umask 022
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PLUGIN=$(cd "${1:-$ROOT/../omdrop-plugin}" && pwd)
-OUT=$ROOT/dist
+OUT=${RPM_OUT:-$ROOT/dist}
 TOP=$(mktemp -d)
 trap 'rm -rf "$TOP"' EXIT
 mkdir -p "$TOP"/{BUILD,RPMS,SRPMS,SPECS,SOURCES} "$OUT"

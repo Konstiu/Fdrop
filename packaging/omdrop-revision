@@ -1,0 +1,5 @@
+# The brentkearney/omdrop-plugin commit the omdrop package is built from:
+# the full 40 characters, because a short SHA is not a pin. install.sh fetches
+# exactly this commit and refuses anything else. Bump it together with
+# patches/omdrop-fedora.patch when the patch needs a newer upstream.
+6af4908310a4fcd1ba7800fcc7b83156bbd7ee77
